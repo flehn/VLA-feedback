@@ -138,8 +138,20 @@ def sample_occlusion(
     min_len: int = 2,
     max_len: int = 4,
     first_visible: int = 2,
+    mode: str = "window",
 ) -> dict:
-    """Sample independent occlusion windows per target color: {color: set_of_timesteps}."""
+    """Sample occlusion per target color: {color: set_of_timesteps}.
+    mode="window": each color independently vanishes for one 2-4 frame window (prob occlusion_prob).
+    mode="flash":  with prob occlusion_prob ALL targets are shown only for the first `first_visible`
+                   frames and stay hidden for the rest of the episode (pure memory task)."""
+    if mode == "flash":
+        hide = (
+            set(range(first_visible, episode_len))
+            if occlusion_prob > 0 and random.random() < occlusion_prob
+            else set()
+        )
+        return {c: set(hide) for c in COLORS}
+    assert mode == "window", f"Unknown occlusion mode: {mode}"
     return {
         c: (
             sample_occlusion_window(episode_len, min_len, max_len, first_visible)
@@ -239,6 +251,8 @@ def generate_vla_dataset(
     occlusion_prob: float = 0.0,
     target_speed: float = 0.0,
     return_hidden: bool = False,
+    occlusion_mode: str = "window",
+    return_exec: bool = False,
 ):
     """
     Generate on-the-fly expert trajectories using a proportional controller.
@@ -251,14 +265,14 @@ def generate_vla_dataset(
       Input Sequence:  [PATCH_0 ... PATCH_63] | ["reach", <color>] | ["ACT_START"] | [ACT_X_BIN]
       Target Sequence: [   ... ignored ...  ] | [  ... ignored ... ] |  [ACT_X_BIN]  | [ACT_Y_BIN]
     """
-    images, input_seqs, target_seqs, hidden_flags = [], [], [], []
+    images, input_seqs, target_seqs, hidden_flags, exec_bins = [], [], [], [], []
     color_names = list(COLORS.keys())
 
     for _ in range(num_episodes):
         gripper_pos, targets = sample_env_state()
         velocities = sample_target_velocities(targets, speed=target_speed, max_steps=episode_len)
         nav_color = random.choice(color_names)
-        hidden_by_color = sample_occlusion(episode_len, occlusion_prob)
+        hidden_by_color = sample_occlusion(episode_len, occlusion_prob, mode=occlusion_mode)
 
         for t in range(episode_len):
             hidden_now = {c for c, ts in hidden_by_color.items() if t in ts}
@@ -295,6 +309,7 @@ def generate_vla_dataset(
             nav_dx = max(-1.0, min(1.0, (nav_goal[0] - gripper_pos[0]) / MAX_STEP_PX))
             nav_dy = max(-1.0, min(1.0, (nav_goal[1] - gripper_pos[1]) / MAX_STEP_PX))
             xb, yb = action_to_bin(nav_dx), action_to_bin(nav_dy)
+            exec_bins.extend([[xb, yb]] * len(color_names))  # action actually executed at step t
             gripper_pos = [
                 max(2.0, min(29.0, gripper_pos[0] + bin_to_action(xb) * MAX_STEP_PX)),
                 max(2.0, min(29.0, gripper_pos[1] + bin_to_action(yb) * MAX_STEP_PX)),
@@ -307,7 +322,9 @@ def generate_vla_dataset(
         torch.tensor(target_seqs, dtype=torch.long),  # [N, 4]
     )
     if return_hidden:
-        return data + (torch.tensor(hidden_flags, dtype=torch.bool),)  # [N] targets occluded?
+        data = data + (torch.tensor(hidden_flags, dtype=torch.bool),)  # [N] targets occluded?
+    if return_exec:
+        data = data + (torch.tensor(exec_bins, dtype=torch.long),)  # [N, 2] executed (x_bin, y_bin)
     return data
 
 
